@@ -2,7 +2,7 @@ name: Wispbyte Auto Restart
 
 on:
   schedule:
-    - cron: '20 3 */5 * *'  # 每 5 天在 UTC 时间 03:20 执行一次
+    - cron: '20 3 */4 * *'  # 每 4 天在 UTC 时间 03:20 执行一次
   workflow_dispatch:
 
 jobs:
