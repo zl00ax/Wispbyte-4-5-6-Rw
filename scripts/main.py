@@ -164,45 +164,6 @@ def check_turnstile_solved(sb) -> bool:
         return False
 
 
-def _click_turnstile_best_effort(sb, scope_selector: Optional[str] = None) -> bool:
-    """尽力点击 Turnstile（先 uc_gui，失败后 JS 兜底）"""
-    try:
-        sb.uc_gui_click_captcha()
-        log("点击 Turnstile (uc_gui)")
-        return True
-    except Exception as e:
-        log(f"uc_gui 点击 Turnstile 失败，尝试 JS 兜底: {e}", "WARN")
-
-    if scope_selector:
-        js = f'''
-            var scope = document.querySelector({json.dumps(scope_selector)});
-            if (!scope) return false;
-            var ts = scope.querySelector('.cf-turnstile, iframe[src*="challenges.cloudflare.com"], iframe');
-            if (!ts) return false;
-            ts.click();
-            ts.dispatchEvent(new MouseEvent('click', {{bubbles: true, cancelable: true}}));
-            return true;
-        '''
-    else:
-        js = '''
-            var ts = document.querySelector('.cf-turnstile, iframe[src*="challenges.cloudflare.com"], iframe');
-            if (!ts) return false;
-            ts.click();
-            ts.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
-            return true;
-        '''
-
-    try:
-        clicked = bool(sb.execute_script(js))
-        if clicked:
-            log("点击 Turnstile (JS 兜底)")
-            return True
-    except Exception as e:
-        log(f"JS 兜底点击 Turnstile 失败: {e}", "WARN")
-
-    return False
-
-
 def wait_for_turnstile_success(sb, timeout: int = 30) -> bool:
     """等待并点击登录页 Turnstile"""
     log("等待 Turnstile 验证...")
@@ -213,8 +174,12 @@ def wait_for_turnstile_success(sb, timeout: int = 30) -> bool:
             log("✅ Turnstile 验证成功")
             return True
         if time.time() - last_click > 3:
-            if _click_turnstile_best_effort(sb):
+            try:
+                sb.uc_gui_click_captcha()
                 last_click = time.time()
+                log("点击 Turnstile")
+            except Exception as e:
+                log(f"点击 Turnstile 异常: {e}", "WARN")
         time.sleep(1)
     log("⏰ Turnstile 验证超时", "WARN")
     return False
@@ -293,8 +258,23 @@ def handle_restart_turnstile_modal(sb, timeout: int = 90) -> bool:
             # 尝试点击 Turnstile
             now = time.time()
             if now - last_click > 3:
-                if _click_turnstile_best_effort(sb, scope_selector='.wisp-start-captcha-modal'):
+                try:
+                    sb.uc_gui_click_captcha()
                     last_click = now
+                    log("CF弹窗内点击 Turnstile (uc_gui)")
+                except Exception:
+                    try:
+                        sb.execute_script('''
+                            var ts = document.querySelector(
+                                '.wisp-start-captcha-modal .cf-turnstile,' +
+                                '.wisp-start-captcha-modal iframe'
+                            );
+                            if (ts) ts.click();
+                        ''')
+                        last_click = now
+                        log("CF弹窗内点击 Turnstile (JS)")
+                    except Exception as e:
+                        log(f"CF弹窗 Turnstile 点击失败: {e}", "WARN")
 
         except Exception as e:
             log(f"CF Turnstile 弹窗处理异常: {e}", "WARN")
@@ -318,7 +298,7 @@ def handle_restart_turnstile_modal(sb, timeout: int = 90) -> bool:
 
 # ====================== 广告页面处理 ======================
 
-def _get_page_situation(sb, identifier: Optional[str] = None, console_url: Optional[str] = None) -> str:
+def _get_page_situation(sb) -> str:
     """
     检测当前页面/弹出情况，返回:
       'adblocker'  - 检测到广告拦截器页面
@@ -327,13 +307,6 @@ def _get_page_situation(sb, identifier: Optional[str] = None, console_url: Optio
       'console'    - 在控制台页面（正常）
       'unknown'    - 未知
     """
-    # alert 优先（会阻塞其他操作）
-    try:
-        _ = sb.driver.switch_to.alert
-        return 'alert'
-    except Exception:
-        pass
-
     try:
         current_url = sb.get_current_url()
     except Exception:
@@ -342,15 +315,6 @@ def _get_page_situation(sb, identifier: Optional[str] = None, console_url: Optio
     # 检查是否在 reward video 页面
     if "reward-video" in current_url or "reward_video" in current_url:
         return 'reward'
-
-    # 检查控制台 URL
-    try:
-        if console_url and current_url.startswith(console_url):
-            return 'console'
-    except Exception:
-        pass
-    if identifier and f"/servers/{identifier}/console" in current_url:
-        return 'console'
 
     # 检查 AdBlocker 拦截页
     try:
@@ -367,7 +331,7 @@ def _get_page_situation(sb, identifier: Optional[str] = None, console_url: Optio
     # 检查广告按钮是否在当前页面出现（内嵌情况）
     try:
         has_embed_btn = sb.execute_script('''
-            return !!(document.getElementById('embedWatchBtn') ||
+            return !!(document.getElementById('embedWatchBtn') || 
                       document.getElementById('embedPlayBtn'));
         ''')
         if has_embed_btn:
@@ -559,12 +523,9 @@ def _wait_for_ad_completion(sb, identifier: str, timeout: int = 300) -> bool:
                 pass
 
             # 信号4: 离开 reward 页面
-            if "reward-video" not in current_url and "reward_video" not in current_url and elapsed > 10:
-                situation = _get_page_situation(sb, identifier=identifier)
-                if situation in ('console',):
-                    log(f"✅ 广告完成 [页面已跳转到控制台]: {safe_id}")
-                    return True
-                if situation not in ('reward', 'adblocker', 'unknown', 'alert'):
+            if "reward-video" not in current_url and elapsed > 10:
+                situation = _get_page_situation(sb)
+                if situation not in ('reward', 'adblocker', 'unknown'):
                     log(f"✅ 广告完成 [页面已跳转到: {current_url[:80]}]: {safe_id}")
                     return True
 
@@ -596,18 +557,18 @@ def handle_reward_ad_flow(sb, identifier: str, console_url: str) -> bool:
     safe_id = mask_server_id(identifier)
     log(f"广告流程处理开始: {safe_id}")
 
-    # 等待页面响应（广告页面/弹窗可能延迟出现）
-    ad_flow_timeout = 45
+    # 等待页面响应（最多 15 秒）
+    ad_flow_timeout = 15
     start = time.time()
 
     while time.time() - start < ad_flow_timeout:
-        situation = _get_page_situation(sb, identifier=identifier, console_url=console_url)
-        log(f"当前页面情况: {situation}")
-
         # 优先处理 Alert 弹窗（因为 alert 会阻塞其他操作）
-        if situation == 'alert' and _dismiss_alert_if_present(sb):
+        if _dismiss_alert_if_present(sb):
             log("✅ 已处理 Alert 弹窗（无广告情况），继续CF验证")
             return True
+
+        situation = _get_page_situation(sb)
+        log(f"当前页面情况: {situation}")
 
         if situation == 'reward':
             # 进入广告观看流程
@@ -655,7 +616,7 @@ def _execute_reward_ad_watch(sb, identifier: str) -> bool:
 
         # 检查是否 failRewardReturn 已经把页面跳回
         current_url = sb.get_current_url()
-        if "reward-video" not in current_url and "reward_video" not in current_url:
+        if "reward-video" not in current_url:
             log(f"广告页面已自动跳转: {current_url[:80]}")
             return True
 
