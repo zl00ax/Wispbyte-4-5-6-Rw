@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '20 3 */4 * *'  # 每 4 天在 UTC 时间 03:20 执行一次
   workflow_dispatch:
+    inputs:
+      accounts:
+        description: '指定运行的邮箱（多个用英文逗号分隔，留空则运行全部）'
+        required: false
+        default: ''
 
 jobs:
   run-script:
@@ -50,6 +55,7 @@ jobs:
           WISPBYTE_5: ${{ secrets.WISPBYTE_5 }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          INPUT_ACCOUNTS: ${{ github.event.inputs.accounts }}
         run: python scripts/main.py
 
       - name: Upload Artifacts on Failure
@@ -57,4 +63,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: error-screenshots
-          path: "*.png"
+          path: output/screenshots/*.png
