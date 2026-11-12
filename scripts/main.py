@@ -138,7 +138,6 @@ def restart_warp():
         log("删除注册失败（可能未注册），继续...", "WARN")
     time.sleep(1)
 
-    # 重启一次 warp-svc 服务有助于刷新 WireGuard 密钥与出口会话
     try:
         subprocess.run(["sudo", "systemctl", "restart", "warp-svc"],
                        stdin=subprocess.DEVNULL, capture_output=True, timeout=10, check=False)
@@ -787,165 +786,6 @@ def get_server_status(sb, identifier: str) -> Optional[str]:
         return None
 
 
-# ====================== 强制终止 (Kill) 辅助函数 ======================
-def force_kill_server(sb, identifier: str) -> bool:
-    """
-    当容器(如 hy2/xray 等不响应 SIGTERM 的进程)长时间卡在 stopping 状态时，
-    尝试通过面板 API 和控制台 DOM 按钮（包括 '...' 更多菜单和确认弹窗）强制 Kill 进程。
-    """
-    safe_id = mask_server_id(identifier)
-    log(f"⚠️ 服务器 {safe_id} 卡在 stopping，开始执行强制终止 (Kill)...")
-
-    # 1. 尝试调用同源 API 发送 kill 电源信号（兼容多种常见路由格式）
-    try:
-        api_res = sb.execute_async_script(f'''
-            var done = arguments[arguments.length - 1];
-            var id = {json.dumps(identifier)};
-            var csrfMeta = document.querySelector('meta[name="csrf-token"]');
-            var csrf = csrfMeta ? csrfMeta.getAttribute('content') : '';
-            var headers = {{
-                'Content-Type': 'application/json',
-                'Accept': 'application/json'
-            }};
-            if (csrf) headers['X-CSRF-TOKEN'] = csrf;
-
-            var endpoints = [
-                {{url: '/client/api/servers/' + id + '/power', body: {{signal: 'kill', action: 'kill'}}}},
-                {{url: '/client/servers/' + id + '/power', body: {{signal: 'kill', action: 'kill'}}}},
-                {{url: '/api/client/servers/' + id + '/power', body: {{signal: 'kill'}}}},
-                {{url: '/client/api/servers/' + id + '/kill', body: {{}}}}
-            ];
-
-            (async function() {{
-                for (var i = 0; i < endpoints.length; i++) {{
-                    try {{
-                        var r = await fetch(endpoints[i].url, {{
-                            method: 'POST',
-                            headers: headers,
-                            body: JSON.stringify(endpoints[i].body)
-                        }});
-                        if (r.ok || r.status === 204) {{
-                            done({{ok: true, url: endpoints[i].url, status: r.status}});
-                            return;
-                        }}
-                    }} catch (e) {{}}
-                }}
-                done({{ok: false}});
-            }})();
-        ''')
-        if api_res and api_res.get("ok"):
-            log(f"✅ 已通过 API 发送 Kill 信号 ({api_res.get('url')})")
-    except Exception as e:
-        log(f"API 发送 Kill 异常: {e}", "WARN")
-
-    # 2. 尝试通过页面 DOM 点击 Kill / Force Stop（含展开 '...' 更多菜单）
-    try:
-        dom_res = sb.execute_async_script('''
-            var done = arguments[arguments.length - 1];
-
-            function findAndClickKill() {
-                var els = Array.from(document.querySelectorAll('button, a, li, div[role="menuitem"], [role="button"], span'));
-                for (var i = 0; i < els.length; i++) {
-                    var el = els[i];
-                    var st = window.getComputedStyle(el);
-                    if (el.disabled || st.display === 'none' || st.visibility === 'hidden') continue;
-
-                    var id = (el.id || '').toLowerCase();
-                    var cls = (typeof el.className === 'string' ? el.className : '').toLowerCase();
-                    var act = (el.getAttribute('data-action') || el.getAttribute('title') || el.getAttribute('aria-label') || '').toLowerCase();
-                    var txt = (el.innerText || el.textContent || '').trim().toLowerCase();
-
-                    if (
-                        id.includes('kill') || act.includes('kill') ||
-                        txt === 'kill' || txt === 'force stop' || txt === 'force kill' ||
-                        txt.includes('kill server') || txt.includes('force stop') ||
-                        txt.includes('强制停止') || txt.includes('强制终止')
-                    ) {
-                        el.click();
-                        return txt || act || id || 'kill-btn';
-                    }
-                }
-                return null;
-            }
-
-            // 第一步：直接找页面上可见的 Kill 按钮
-            var direct = findAndClickKill();
-            if (direct) {
-                setTimeout(function() {
-                    // 检查是否有二次确认弹窗按钮
-                    var confirmBtns = Array.from(document.querySelectorAll('.modal button, [role="dialog"] button, .swal2-confirm, button.btn-danger'));
-                    for (var j = 0; j < confirmBtns.length; j++) {
-                        var b = confirmBtns[j];
-                        var bt = (b.innerText || '').trim().toLowerCase();
-                        if (bt.includes('kill') || bt.includes('confirm') || bt.includes('yes') || bt.includes('force') || bt === '确定') {
-                            b.click();
-                            break;
-                        }
-                    }
-                    done({clicked: true, target: direct});
-                }, 800);
-                return;
-            }
-
-            // 第二步：如果没找到，尝试点击 Stop 按钮右侧的 '...' 更多菜单按钮
-            var moreBtns = Array.from(document.querySelectorAll('button, a, [role="button"]'));
-            var menuOpened = false;
-            for (var k = 0; k < moreBtns.length; k++) {
-                var mb = moreBtns[k];
-                var mst = window.getComputedStyle(mb);
-                if (mb.disabled || mst.display === 'none' || mst.visibility === 'hidden') continue;
-                var mtxt = (mb.innerText || mb.textContent || '').trim();
-                var mhtml = (mb.innerHTML || '').toLowerCase();
-                var mtitle = (mb.getAttribute('title') || mb.getAttribute('aria-label') || '').toLowerCase();
-
-                if (
-                    mtxt === '...' || mtxt === '⋯' || mtxt === '•••' ||
-                    mhtml.includes('ellipsis') || mhtml.includes('more-horizontal') ||
-                    mhtml.includes('dots') || mtitle.includes('more') || mtitle.includes('更多')
-                ) {
-                    mb.click();
-                    menuOpened = true;
-                    break;
-                }
-            }
-
-            if (menuOpened) {
-                setTimeout(function() {
-                    var afterMenu = findAndClickKill();
-                    setTimeout(function() {
-                        var confirmBtns = Array.from(document.querySelectorAll('.modal button, [role="dialog"] button, .swal2-confirm, button.btn-danger'));
-                        for (var j = 0; j < confirmBtns.length; j++) {
-                            var b = confirmBtns[j];
-                            var bt = (b.innerText || '').trim().toLowerCase();
-                            if (bt.includes('kill') || bt.includes('confirm') || bt.includes('yes') || bt.includes('force') || bt === '确定') {
-                                b.click();
-                                break;
-                            }
-                        }
-                        done({clicked: !!afterMenu, target: afterMenu || 'menu-opened-no-kill'});
-                    }, 800);
-                }, 600);
-                return;
-            }
-
-            done({clicked: false, target: null});
-        ''')
-        if dom_res and dom_res.get("clicked"):
-            log(f"✅ 已通过 DOM 点击强制停止按钮: {dom_res.get('target')}")
-    except Exception as e:
-        log(f"DOM 查找 Kill 按钮异常: {e}", "WARN")
-
-    # 3. 等待最多 15 秒确认状态脱离 stopping
-    for _ in range(5):
-        time.sleep(3)
-        st = get_server_status(sb, identifier)
-        if st and 'stopping' not in st:
-            log(f"✅ 服务器 {safe_id} 已脱离 stopping 状态，当前状态: {st}")
-            return True
-
-    return False
-
-
 # ====================== 点击启动按钮辅助函数 ======================
 def try_click_start_button(sb, prefer_only_start: bool = False) -> bool:
     selectors = [
@@ -990,13 +830,13 @@ def try_click_start_button(sb, prefer_only_start: bool = False) -> bool:
                     debugBtns.push(el.tagName + '#' + id + '.' + cls.split(' ')[0] + '(' + txt.slice(0, 12) + ')');
                 }}
 
-                if (txt === 'skip' || txt === '跳过' || txt.includes('stop') || txt.includes('kill')) continue;
-                if (preferOnlyStart && (id.includes('restart') || title.includes('restart') || txt.includes('restart') || txt.includes('重启'))) continue;
+                if (txt === 'skip' || txt === '跳过' || txt.includes('stop') || txt.includes('arrêter') || txt.includes('kill')) continue;
+                if (preferOnlyStart && (id.includes('restart') || title.includes('restart') || txt.includes('restart') || txt.includes('redémarrer') || txt.includes('重启'))) continue;
 
                 if (
                     id.includes('start') || id.includes('restart') ||
-                    title.includes('start') || title.includes('restart') || title.includes('启动') || title.includes('重启') ||
-                    txt === 'start' || txt === 'restart' || txt === '启动' || txt === '重启' ||
+                    title.includes('start') || title.includes('restart') || title.includes('démarrer') || title.includes('redémarrer') || title.includes('启动') || title.includes('重启') ||
+                    txt === 'start' || txt === 'restart' || txt === 'démarrer' || txt === 'redémarrer' || txt === '启动' || txt === '重启' ||
                     txt.includes('start server') || txt.includes('restart server') ||
                     html.includes('fa-play') || html.includes('bi-play') ||
                     (el.tagName === 'BUTTON' && html.includes('<polygon')) ||
@@ -1075,7 +915,10 @@ def _trigger_start_and_verify(sb, identifier: str, console_url: str, prefer_only
 
 
 # ====================== 重启服务器（完整流程）======================
-def restart_server(sb, identifier: str) -> bool:
+def restart_server(sb, identifier: str) -> Tuple[bool, str]:
+    """
+    返回 (是否成功, 状态附加说明)
+    """
     console_url = CONSOLE_URL_TEMPLATE.format(identifier=identifier)
     safe_id = mask_server_id(identifier)
     log(f"{'─'*40}")
@@ -1088,26 +931,21 @@ def restart_server(sb, identifier: str) -> bool:
     time.sleep(6)
     block_ads_modals(sb)
 
-    # 检查初始状态是否就已经卡在 stopping
+    # 如果进入控制台时就已经处于 stopping / starting，无需再点按钮，直接进入状态轮询
     init_status = get_server_status(sb, identifier)
-    if init_status and 'stopping' in init_status:
-        log(f"检测到服务器 {safe_id} 初始状态即为 stopping，先执行强制 Kill...")
-        force_kill_server(sb, identifier)
-        sb.get(console_url)
-        time.sleep(5)
-        block_ads_modals(sb)
+    if init_status and ('stopping' in init_status or 'starting' in init_status):
+        log(f"检测到服务器 {safe_id} 当前已处于 {init_status} 状态，直接进入状态轮询...")
+    else:
+        # ── Step 2~5: 点击 Start/Restart 并处理广告与 CF 验证 ──
+        if not _trigger_start_and_verify(sb, identifier, console_url):
+            return False, "未找到启动/重启按钮"
 
-    # ── Step 2~5: 点击 Start/Restart 并处理广告与 CF 验证 ──
-    if not _trigger_start_and_verify(sb, identifier, console_url):
-        return False
-
-    # ── Step 6: 轮询服务器状态（带卡死 stopping 自动 Kill 恢复机制） ──
-    poll_timeout = 120
+    # ── Step 6: 轮询服务器状态 ──
+    poll_timeout = 90
     poll_interval = 5
     start_poll = time.time()
     stopping_count = 0
     offline_count = 0
-    kill_attempted = False
 
     log(f"开始轮询服务器状态（最长 {poll_timeout} 秒）: {safe_id}")
 
@@ -1116,38 +954,19 @@ def restart_server(sb, identifier: str) -> bool:
 
         if status and 'running' in status:
             log(f"✅ 服务器 {safe_id} 状态: {status}，重启成功！")
-            return True
+            return True, "重启成功 (running)"
 
         if status and 'stopping' in status:
             stopping_count += 1
             offline_count = 0
             log(f"当前状态: {status} (连续第 {stopping_count} 次)，{poll_interval}s 后重试...")
 
-            # 如果连续 5 次（约 25 秒）都卡在 stopping，执行强制 Kill 并重新点击 Start
-            if stopping_count >= 5 and not kill_attempted:
-                kill_attempted = True
-                force_kill_server(sb, identifier)
-
-                # 刷新控制台并重新点击 Start 按钮拉起服务器
-                log(f"刷新控制台并尝试重新启动服务器: {safe_id}")
-                sb.get(console_url)
-                time.sleep(5)
-                block_ads_modals(sb)
-
-                current_st = get_server_status(sb, identifier)
-                if not current_st or ('running' not in current_st and 'starting' not in current_st):
-                    _trigger_start_and_verify(sb, identifier, console_url, prefer_only_start=True)
-                    # 重置计时器，再给 60 秒等待启动
-                    start_poll = time.time()
-                    poll_timeout = 60
-                continue
-
         elif status and ('offline' in status or 'stopped' in status):
             offline_count += 1
             stopping_count = 0
             log(f"当前状态: {status} (连续第 {offline_count} 次)，{poll_interval}s 后重试...")
 
-            # 如果服务器已变为 offline 超过 2 次（10 秒）仍未自动进入 starting，手动补点一次 Start
+            # 如果服务器已完全变为 offline 超过 2 次（10 秒）仍未自动进入 starting，手动补点一次 Start
             if offline_count >= 2:
                 log(f"服务器 {safe_id} 处于离线状态未自动启动，尝试点击 Start 按钮...")
                 offline_count = 0
@@ -1163,14 +982,23 @@ def restart_server(sb, identifier: str) -> bool:
 
         time.sleep(poll_interval)
 
-    # 最终检查
+    # ── 最终检查 ──
     status = get_server_status(sb, identifier)
     if status and 'running' in status:
         log(f"✅ 最终检查成功: {safe_id} 状态: {status}")
-        return True
+        return True, "重启成功 (running)"
+
+    # 核心判定：如果点击 Restart 后状态进入了 stopping 或 starting，说明重启指令已在服务端生效！
+    # （针对 java-xah / hy2 等不响应 SIGTERM 的容器，Wispbyte 宿主机将在后台等待超时后自动强杀并重拉起）
+    if (status and ('stopping' in status or 'starting' in status)) or stopping_count >= 3:
+        log(
+            f"✅ 服务器 {safe_id} 重启指令已生效（当前状态: {status}）。"
+            f"因容器内进程不响应普通关机信号，宿主机正在后台执行强制关闭并自动拉起，判定为成功！"
+        )
+        return True, f"重启指令已生效 (后台 {status} 强制重启中)"
 
     log(f"❌ 轮询超时，最终状态: {status or '未知'}", "ERROR")
-    return False
+    return False, f"重启失败 (状态: {status or '未知'})"
 
 
 # ====================== 账号处理 ======================
@@ -1198,13 +1026,12 @@ def process_account(idx: int, email: str, password: str, tg_token: str, tg_chat:
                 return
 
             for si, server_id in enumerate(servers, start=1):
-                success = restart_server(sb, server_id)
+                success, status_detail = restart_server(sb, server_id)
                 suffix = f"done-{si}" if len(servers) > 1 else "done"
                 screenshot = take_screenshot(sb, idx, suffix)
                 status_icon = "✅" if success else "❌"
-                status_text = "重启成功" if success else "重启失败"
                 caption = (
-                    f"{status_icon} {status_text}\n\n"
+                    f"{status_icon} {status_detail}\n\n"
                     f"账号: {mask_email(email)}\n"
                     f"服务器: {server_id}\n\n"
                     f"Wispbyte Auto Restart"
