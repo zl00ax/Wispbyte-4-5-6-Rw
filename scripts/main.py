@@ -138,17 +138,15 @@ def restart_warp():
         log("删除注册失败（可能未注册），继续...", "WARN")
     time.sleep(1)
 
-    try:
-        subprocess.run(["sudo", "systemctl", "restart", "warp-svc"],
-                       stdin=subprocess.DEVNULL, capture_output=True, timeout=10, check=False)
-        time.sleep(3)
-    except Exception:
-        pass
-
     if not _safe_warp_cmd(["registration", "new"], timeout=15):
-        log("注册新 WARP 节点超时或失败，再次尝试...", "WARN")
-        time.sleep(2)
-        _safe_warp_cmd(["registration", "new"], timeout=12)
+        log("注册新 WARP 节点超时或失败，尝试重启服务...", "WARN")
+        try:
+            subprocess.run(["sudo", "systemctl", "restart", "warp-svc"],
+                           stdin=subprocess.DEVNULL, capture_output=True, timeout=10, check=False)
+            time.sleep(3)
+            _safe_warp_cmd(["registration", "new"], timeout=12)
+        except Exception:
+            pass
 
     time.sleep(2)
     _safe_warp_cmd(["connect"], timeout=12)
@@ -360,6 +358,7 @@ def _get_page_situation(sb) -> str:
     except Exception:
         return 'unknown'
 
+    # 检查 URL 路径是否为广告页（兼容 venatus-reward-demo-prod 和 reward-video）
     if is_ad_or_reward_url(current_url):
         return 'reward'
 
@@ -495,6 +494,11 @@ def _click_watch_ad_btn(sb) -> bool:
 
 
 def _wait_for_ad_completion(sb, identifier: str, timeout: int = 300) -> bool:
+    """
+    等待广告观看完成。
+    注意：因为广告页 URL 为 /client/venatus-reward-demo-prod?return=.../servers/{id}/console，
+    必须检查 urlparse(current_url).path 而不是整个 current_url，否则会在第 0 秒误判已回到控制台！
+    """
     safe_id = mask_server_id(identifier)
     log(f"广告开始播放，等待完成（最长 {timeout}s）: {safe_id}")
     start = time.time()
@@ -502,22 +506,26 @@ def _wait_for_ad_completion(sb, identifier: str, timeout: int = 300) -> bool:
     while time.time() - start < timeout:
         elapsed = int(time.time() - start)
         try:
+            # 檢查是否有無廣告 Alert 彈窗
             if _dismiss_alert_if_present(sb):
                 log(f"✅ 广告播放期间处理了 Alert 弹窗: {safe_id}")
                 time.sleep(3)
 
             current_url = sb.get_current_url()
 
+            # 信号1: URL 含 rewardDone=1
             if "rewardDone=1" in current_url:
                 log(f"✅ 广告完成 [rewardDone=1]: {safe_id}")
                 time.sleep(3)
                 return True
 
+            # 信号2: URL 的主路径（不含 ?return= 参数）真正回到了控制台
             if is_console_url(current_url, identifier):
                 log(f"✅ 广告完成 [已跳转回控制台]: {safe_id}")
                 time.sleep(3)
                 return True
 
+            # 信号3: embedStatus 显示完成文字
             try:
                 status_info = sb.execute_script('''
                     var st = document.getElementById('embedStatus');
@@ -532,6 +540,7 @@ def _wait_for_ad_completion(sb, identifier: str, timeout: int = 300) -> bool:
                     text = status_info.get('text', '').lower()
                     if any(kw in text for kw in ['starting', 'saving', 'returning', 'session', 'complete', 'redirect']):
                         log(f"✅ 广告完成 [embedStatus='{text[:50]}']: {safe_id}")
+                        # 等待页面自动跳转回控制台（最多等 20 秒）
                         for _ in range(20):
                             if is_console_url(sb.get_current_url(), identifier):
                                 log("✅ 已自动跳转回控制台")
@@ -541,6 +550,7 @@ def _wait_for_ad_completion(sb, identifier: str, timeout: int = 300) -> bool:
             except Exception:
                 pass
 
+            # 信号4: 页面主路径已离开广告页
             if not is_ad_or_reward_url(current_url) and elapsed > 10:
                 situation = _get_page_situation(sb)
                 if situation not in ('reward', 'adblocker', 'unknown'):
@@ -633,28 +643,120 @@ def _execute_reward_ad_watch(sb, identifier: str) -> bool:
 
 
 # ====================== 登录流程 ======================
+def _find_visible_selector(sb, selectors: List[str], timeout: int = 15) -> Optional[str]:
+    """轮询多个候选 CSS 选择器，返回第一个可见的元素选择器"""
+    start = time.time()
+    while time.time() - start < timeout:
+        for sel in selectors:
+            try:
+                if sb.is_element_visible(sel):
+                    return sel
+            except Exception:
+                continue
+        time.sleep(0.5)
+    return None
+
+
+def _click_login_submit(sb, pwd_sel: str) -> bool:
+    """兼容新版/旧版登录页的提交按钮点击"""
+    for sel in ('button[type="submit"]', 'button.login-btn', 'form button[type="submit"]'):
+        try:
+            if sb.is_element_visible(sel):
+                sb.click(sel)
+                log(f"✅ 已点击登录按钮 ({sel})")
+                return True
+        except Exception:
+            continue
+
+    # 按按钮文本精准匹配 "Log in" / "Sign in"（避开 Discord/Google/GitHub 快捷登录按钮）
+    try:
+        clicked = sb.execute_script('''
+            var btns = document.querySelectorAll('button, input[type="submit"]');
+            for (var i = 0; i < btns.length; i++) {
+                var el = btns[i];
+                var st = window.getComputedStyle(el);
+                if (el.disabled || st.display === 'none' || st.visibility === 'hidden') continue;
+                var txt = (el.innerText || el.value || '').trim().toLowerCase();
+                if (txt === 'log in' || txt === 'login' || txt === 'sign in') {
+                    el.click();
+                    return true;
+                }
+            }
+            var form = document.querySelector('form');
+            if (form) {
+                if (form.requestSubmit) form.requestSubmit();
+                else form.submit();
+                return true;
+            }
+            return false;
+        ''')
+        if clicked:
+            log("✅ 已通过文本/表单提交登录")
+            return True
+    except Exception as e:
+        log(f"JS 提交登录异常: {e}", "WARN")
+
+    # 兜底：在密码框直接按回车提交
+    try:
+        sb.type(pwd_sel, "\n")
+        log("✅ 已通过回车提交登录")
+        return True
+    except Exception:
+        return False
+
+
 def login(sb, email: str, password: str) -> bool:
+    EMAIL_SELECTORS = [
+        'input[type="email"]',
+        'input#email',
+        'input[name="email"]',
+        'input[autocomplete="email"]',
+        'input[autocomplete="username"]',
+        'input[placeholder*="email" i]',
+        'form input[type="text"]',
+    ]
+    PASSWORD_SELECTORS = [
+        'input[type="password"]',
+        'input#password',
+        'input[name="password"]',
+        'input[autocomplete="current-password"]',
+    ]
+
     log("访问登录页...")
     sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=10)
     time.sleep(4)
 
-    try:
-        sb.wait_for_element_visible('input#email', timeout=15)
-        log("✅ 找到登录表单")
-    except TimeoutException:
+    email_sel = _find_visible_selector(sb, EMAIL_SELECTORS, timeout=15)
+    if not email_sel:
         log("未找到登录表单，尝试重新连接...", "WARN")
         sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=10)
         time.sleep(5)
+        email_sel = _find_visible_selector(sb, EMAIL_SELECTORS, timeout=12)
+
+    if not email_sel:
         try:
-            sb.wait_for_element_visible('input#email', timeout=10)
-        except TimeoutException:
-            log("仍然未找到登录表单", "ERROR")
-            return False
+            inputs_info = sb.execute_script('''
+                return Array.from(document.querySelectorAll('input')).map(function(el) {
+                    return {tag: el.tagName, type: el.type, id: el.id, name: el.name, placeholder: el.placeholder};
+                });
+            ''')
+            log(f"页面现有 input 列表: {inputs_info}", "WARN")
+        except Exception:
+            pass
+        log("仍然未找到邮箱输入框", "ERROR")
+        return False
+
+    pwd_sel = _find_visible_selector(sb, PASSWORD_SELECTORS, timeout=10)
+    if not pwd_sel:
+        log("未找到密码输入框", "ERROR")
+        return False
+
+    log(f"✅ 找到登录表单 (email={email_sel}, password={pwd_sel})")
 
     log("填写登录信息...")
-    sb.type('input#email', email)
+    sb.type(email_sel, email)
     time.sleep(0.5)
-    sb.type('input#password', password)
+    sb.type(pwd_sel, password)
     time.sleep(0.5)
 
     if not wait_for_turnstile_success(sb, timeout=35):
@@ -662,10 +764,9 @@ def login(sb, email: str, password: str) -> bool:
         return False
 
     log("提交登录...")
-    try:
-        sb.click('button.login-btn')
-    except Exception:
-        sb.execute_script('document.querySelector("form#login-form").submit()')
+    if not _click_login_submit(sb, pwd_sel):
+        log("提交登录失败", "ERROR")
+        return False
 
     log("等待跳转到仪表盘...")
     for _ in range(15):
@@ -712,7 +813,7 @@ def login(sb, email: str, password: str) -> bool:
     return True
 
 
-# ====================== 获取服务器列表与状态 ======================
+# ====================== 获取服务器列表 ======================
 def get_servers(sb) -> List[str]:
     log("通过 fetch 请求服务器列表...")
     try:
@@ -761,44 +862,14 @@ def get_servers(sb) -> List[str]:
     return []
 
 
-def get_server_status(sb, identifier: str) -> Optional[str]:
-    """查询单台服务器当前状态 (running / starting / stopping / offline)"""
-    status_script = f'''
-        var callback = arguments[arguments.length - 1];
-        var serverId = {json.dumps(identifier)};
-        fetch('/client/api/servers/status', {{
-            method: 'GET',
-            headers: {{ 'Accept': 'application/json' }}
-        }})
-        .then(function(res) {{ return res.json(); }})
-        .then(function(data) {{
-            var server = (data.servers || []).find(function(s) {{
-                return s.identifier === serverId;
-            }});
-            callback(server ? server.current_state : null);
-        }})
-        .catch(function() {{ callback(null); }});
-    '''
-    try:
-        res = sb.execute_async_script(status_script)
-        return str(res).lower().strip() if res else None
-    except Exception:
-        return None
-
-
 # ====================== 点击启动按钮辅助函数 ======================
-def try_click_start_button(sb, prefer_only_start: bool = False) -> bool:
-    selectors = [
+def try_click_start_button(sb) -> bool:
+    for btn_sel, btn_name in [
         ('button#start-btn', 'Start(#start-btn)'),
+        ('button#restart-btn', 'Restart(#restart-btn)'),
         ('[data-action="start"]', 'Start(data-action)'),
-    ]
-    if not prefer_only_start:
-        selectors.extend([
-            ('button#restart-btn', 'Restart(#restart-btn)'),
-            ('[data-action="restart"]', 'Restart(data-action)'),
-        ])
-
-    for btn_sel, btn_name in selectors:
+        ('[data-action="restart"]', 'Restart(data-action)'),
+    ]:
         try:
             if sb.is_element_visible(btn_sel):
                 sb.click(btn_sel)
@@ -808,14 +879,13 @@ def try_click_start_button(sb, prefer_only_start: bool = False) -> bool:
             continue
 
     try:
-        res = sb.execute_async_script(f'''
-            var preferOnlyStart = {json.dumps(prefer_only_start)};
+        res = sb.execute_async_script('''
             var done = arguments[arguments.length - 1];
             var els = Array.from(document.querySelectorAll('button, a, [role="button"]'));
             var found = null;
             var debugBtns = [];
 
-            for (var i = 0; i < els.length; i++) {{
+            for (var i = 0; i < els.length; i++) {
                 var el = els[i];
                 var st = window.getComputedStyle(el);
                 if (el.disabled || st.display === 'none' || st.visibility === 'hidden') continue;
@@ -826,29 +896,28 @@ def try_click_start_button(sb, prefer_only_start: bool = False) -> bool:
                 var title = (el.getAttribute('title') || el.getAttribute('aria-label') || el.getAttribute('data-action') || '').toLowerCase();
                 var html = (el.innerHTML || '').toLowerCase();
 
-                if (el.tagName === 'BUTTON') {{
+                if (el.tagName === 'BUTTON') {
                     debugBtns.push(el.tagName + '#' + id + '.' + cls.split(' ')[0] + '(' + txt.slice(0, 12) + ')');
-                }}
+                }
 
-                if (txt === 'skip' || txt === '跳过' || txt.includes('stop') || txt.includes('arrêter') || txt.includes('kill')) continue;
-                if (preferOnlyStart && (id.includes('restart') || title.includes('restart') || txt.includes('restart') || txt.includes('redémarrer') || txt.includes('重启'))) continue;
+                if (txt === 'skip' || txt === '跳过' || txt.includes('stop') || txt.includes('kill')) continue;
 
                 if (
                     id.includes('start') || id.includes('restart') ||
-                    title.includes('start') || title.includes('restart') || title.includes('démarrer') || title.includes('redémarrer') || title.includes('启动') || title.includes('重启') ||
-                    txt === 'start' || txt === 'restart' || txt === 'démarrer' || txt === 'redémarrer' || txt === '启动' || txt === '重启' ||
+                    title.includes('start') || title.includes('restart') || title.includes('启动') || title.includes('重启') ||
+                    txt === 'start' || txt === 'restart' || txt === '启动' || txt === '重启' ||
                     txt.includes('start server') || txt.includes('restart server') ||
                     html.includes('fa-play') || html.includes('bi-play') ||
                     (el.tagName === 'BUTTON' && html.includes('<polygon')) ||
                     (el.tagName === 'BUTTON' && html.includes('m8 5v14l11-7z')) ||
                     (el.tagName === 'BUTTON' && html.includes('5 3 19 12 5 21'))
-                ) {{
+                ) {
                     el.click();
                     found = (txt || title || id || 'play-icon-btn');
                     break;
-                }}
-            }}
-            done({{clicked: !!found, target: found, allButtons: debugBtns.slice(0, 25)}});
+                }
+            }
+            done({clicked: !!found, target: found, allButtons: debugBtns.slice(0, 25)});
         ''')
         if res and res.get("clicked"):
             log(f"✅ 已通过 DOM 匹配点击启动按钮: {res.get('target')}")
@@ -862,63 +931,8 @@ def try_click_start_button(sb, prefer_only_start: bool = False) -> bool:
     return False
 
 
-def _trigger_start_and_verify(sb, identifier: str, console_url: str, prefer_only_start: bool = False) -> bool:
-    """点击启动/重启按钮，并处理可能随之触发的广告与 CF Turnstile 验证"""
-    clicked = try_click_start_button(sb, prefer_only_start=prefer_only_start)
-
-    if not clicked:
-        log("等待 4 秒后重试查找控制台启动按钮...")
-        time.sleep(4)
-        block_ads_modals(sb)
-        clicked = try_click_start_button(sb, prefer_only_start=prefer_only_start)
-
-    if not clicked:
-        log("控制台未找到启动按钮，返回仪表盘尝试点击 [▷] 快捷启动按钮...")
-        sb.get(DASHBOARD_URL)
-        time.sleep(5)
-        block_ads_modals(sb)
-        clicked = try_click_start_button(sb, prefer_only_start=prefer_only_start)
-
-    if not clicked:
-        log("未找到可用的 Start/Restart 按钮", "ERROR")
-        return False
-
-    time.sleep(3)
-
-    # 处理广告流程
-    log("=== 开始处理广告流程 ===")
-    handle_reward_ad_flow(sb, identifier, console_url)
-    log("=== 广告流程处理完毕 ===")
-
-    # 确保回到控制台页面
-    time.sleep(2)
-    current_url = sb.get_current_url()
-    if not is_console_url(current_url, identifier) or is_ad_or_reward_url(current_url):
-        log(f"当前不在控制台页面（{current_url[:80]}），重新导航...")
-        sb.get(console_url)
-        time.sleep(5)
-        block_ads_modals(sb)
-    else:
-        log("当前在控制台页面，无需重新导航")
-        block_ads_modals(sb)
-
-    # 处理 CF Turnstile 验证弹窗
-    log("=== 开始处理 CF Turnstile 验证 ===")
-    cf_result = handle_restart_turnstile_modal(sb, timeout=90)
-    if not cf_result:
-        log("CF Turnstile 验证失败", "WARN")
-    else:
-        log("=== CF Turnstile 验证完成 ===")
-
-    block_ads_modals(sb)
-    return True
-
-
 # ====================== 重启服务器（完整流程）======================
-def restart_server(sb, identifier: str) -> Tuple[bool, str]:
-    """
-    返回 (是否成功, 状态附加说明)
-    """
+def restart_server(sb, identifier: str) -> bool:
     console_url = CONSOLE_URL_TEMPLATE.format(identifier=identifier)
     safe_id = mask_server_id(identifier)
     log(f"{'─'*40}")
@@ -931,74 +945,101 @@ def restart_server(sb, identifier: str) -> Tuple[bool, str]:
     time.sleep(6)
     block_ads_modals(sb)
 
-    # 如果进入控制台时就已经处于 stopping / starting，无需再点按钮，直接进入状态轮询
-    init_status = get_server_status(sb, identifier)
-    if init_status and ('stopping' in init_status or 'starting' in init_status):
-        log(f"检测到服务器 {safe_id} 当前已处于 {init_status} 状态，直接进入状态轮询...")
+    # ── Step 2: 点击 Start / Restart ──
+    clicked = try_click_start_button(sb)
+
+    if not clicked:
+        log("等待 4 秒后重试查找控制台启动按钮...")
+        time.sleep(4)
+        block_ads_modals(sb)
+        clicked = try_click_start_button(sb)
+
+    if not clicked:
+        log("控制台未找到启动按钮，返回仪表盘尝试点击 [▷] 快捷启动按钮...")
+        sb.get(DASHBOARD_URL)
+        time.sleep(5)
+        block_ads_modals(sb)
+        clicked = try_click_start_button(sb)
+
+    if not clicked:
+        log("未找到 Start/Restart 按钮", "ERROR")
+        return False
+
+    # 等待页面响应
+    time.sleep(3)
+
+    # ── Step 3: 处理广告流程 ──
+    log("=== 开始处理广告流程 ===")
+    handle_reward_ad_flow(sb, identifier, console_url)
+    log("=== 广告流程处理完毕 ===")
+
+    # ── Step 4: 确保回到控制台页面 ──
+    time.sleep(2)
+    current_url = sb.get_current_url()
+    if not is_console_url(current_url, identifier) or is_ad_or_reward_url(current_url):
+        log(f"当前不在控制台页面（{current_url[:80]}），重新导航...")
+        sb.get(console_url)
+        time.sleep(5)
+        block_ads_modals(sb)
     else:
-        # ── Step 2~5: 点击 Start/Restart 并处理广告与 CF 验证 ──
-        if not _trigger_start_and_verify(sb, identifier, console_url):
-            return False, "未找到启动/重启按钮"
+        log("当前在控制台页面，无需重新导航")
+        block_ads_modals(sb)
+
+    # ── Step 5: 处理 CF Turnstile 验证弹窗 ──
+    log("=== 开始处理 CF Turnstile 验证 ===")
+    cf_result = handle_restart_turnstile_modal(sb, timeout=90)
+    if not cf_result:
+        log("CF Turnstile 验证失败", "WARN")
+    else:
+        log("=== CF Turnstile 验证完成 ===")
+
+    block_ads_modals(sb)
 
     # ── Step 6: 轮询服务器状态 ──
-    poll_timeout = 90
+    log(f"开始轮询服务器状态（最长 60 秒）: {safe_id}")
+    poll_timeout = 60
     poll_interval = 5
     start_poll = time.time()
-    stopping_count = 0
-    offline_count = 0
 
-    log(f"开始轮询服务器状态（最长 {poll_timeout} 秒）: {safe_id}")
+    status_script = f'''
+        var callback = arguments[arguments.length - 1];
+        var serverId = {json.dumps(identifier)};
+        fetch('/client/api/servers/status', {{
+            method: 'GET',
+            headers: {{ 'Accept': 'application/json' }}
+        }})
+        .then(function(res) {{ return res.json(); }})
+        .then(function(data) {{
+            var server = data.servers.find(function(s) {{
+                return s.identifier === serverId;
+            }});
+            callback(server ? server.current_state : null);
+        }})
+        .catch(function() {{ callback(null); }});
+    '''
 
     while time.time() - start_poll < poll_timeout:
-        status = get_server_status(sb, identifier)
-
-        if status and 'running' in status:
-            log(f"✅ 服务器 {safe_id} 状态: {status}，重启成功！")
-            return True, "重启成功 (running)"
-
-        if status and 'stopping' in status:
-            stopping_count += 1
-            offline_count = 0
-            log(f"当前状态: {status} (连续第 {stopping_count} 次)，{poll_interval}s 后重试...")
-
-        elif status and ('offline' in status or 'stopped' in status):
-            offline_count += 1
-            stopping_count = 0
-            log(f"当前状态: {status} (连续第 {offline_count} 次)，{poll_interval}s 后重试...")
-
-            # 如果服务器已完全变为 offline 超过 2 次（10 秒）仍未自动进入 starting，手动补点一次 Start
-            if offline_count >= 2:
-                log(f"服务器 {safe_id} 处于离线状态未自动启动，尝试点击 Start 按钮...")
-                offline_count = 0
-                sb.get(console_url)
-                time.sleep(5)
-                block_ads_modals(sb)
-                _trigger_start_and_verify(sb, identifier, console_url, prefer_only_start=True)
-                continue
-        else:
-            stopping_count = 0
-            offline_count = 0
+        try:
+            status = sb.execute_async_script(status_script)
+            if status and 'running' in str(status).lower():
+                log(f"✅ 服务器 {safe_id} 状态: {status}，重启成功！")
+                return True
             log(f"当前状态: {status or '未知'}，{poll_interval}s 后重试...")
-
+        except Exception as e:
+            log(f"状态检查异常: {e}", "WARN")
         time.sleep(poll_interval)
 
-    # ── 最终检查 ──
-    status = get_server_status(sb, identifier)
-    if status and 'running' in status:
-        log(f"✅ 最终检查成功: {safe_id} 状态: {status}")
-        return True, "重启成功 (running)"
-
-    # 核心判定：如果点击 Restart 后状态进入了 stopping 或 starting，说明重启指令已在服务端生效！
-    # （针对 java-xah / hy2 等不响应 SIGTERM 的容器，Wispbyte 宿主机将在后台等待超时后自动强杀并重拉起）
-    if (status and ('stopping' in status or 'starting' in status)) or stopping_count >= 3:
-        log(
-            f"✅ 服务器 {safe_id} 重启指令已生效（当前状态: {status}）。"
-            f"因容器内进程不响应普通关机信号，宿主机正在后台执行强制关闭并自动拉起，判定为成功！"
-        )
-        return True, f"重启指令已生效 (后台 {status} 强制重启中)"
-
-    log(f"❌ 轮询超时，最终状态: {status or '未知'}", "ERROR")
-    return False, f"重启失败 (状态: {status or '未知'})"
+    # 最终检查
+    try:
+        status = sb.execute_async_script(status_script)
+        if status and 'running' in str(status).lower():
+            log(f"✅ 最终检查成功: {safe_id} 状态: {status}")
+            return True
+        log(f"❌ 轮询超时，最终状态: {status or '未知'}", "ERROR")
+        return False
+    except Exception as e:
+        log(f"最终状态检查失败: {e}", "ERROR")
+        return False
 
 
 # ====================== 账号处理 ======================
@@ -1026,12 +1067,13 @@ def process_account(idx: int, email: str, password: str, tg_token: str, tg_chat:
                 return
 
             for si, server_id in enumerate(servers, start=1):
-                success, status_detail = restart_server(sb, server_id)
+                success = restart_server(sb, server_id)
                 suffix = f"done-{si}" if len(servers) > 1 else "done"
                 screenshot = take_screenshot(sb, idx, suffix)
                 status_icon = "✅" if success else "❌"
+                status_text = "重启成功" if success else "重启失败"
                 caption = (
-                    f"{status_icon} {status_detail}\n\n"
+                    f"{status_icon} {status_text}\n\n"
                     f"账号: {mask_email(email)}\n"
                     f"服务器: {server_id}\n\n"
                     f"Wispbyte Auto Restart"
