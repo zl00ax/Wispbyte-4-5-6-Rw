@@ -2,17 +2,12 @@ name: Wispbyte Auto Restart
 
 on:
   schedule:
-    - cron: '20 3 */4 * *'  # 每 4 天在 UTC 时间 03:20 执行一次
+    - cron: '20 3 */5 * *'  # 每 5 天在 UTC 时间 03:20 执行一次
   workflow_dispatch:
-    inputs:
-      accounts:
-        description: '指定运行的邮箱（多个用英文逗号分隔，留空则运行全部）'
-        required: false
-        default: ''
 
 jobs:
   run-script:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout code
@@ -27,10 +22,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y wget curl unzip
-          wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
-          echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
-          sudo apt-get update
-          sudo apt-get install -y google-chrome-stable
+          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo apt-get install -y ./google-chrome-stable_current_amd64.deb
+          rm -f google-chrome-stable_current_amd64.deb
 
       - name: Install Dependencies
         run: |
@@ -55,7 +49,6 @@ jobs:
           WISPBYTE_5: ${{ secrets.WISPBYTE_5 }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          INPUT_ACCOUNTS: ${{ github.event.inputs.accounts }}
         run: python scripts/main.py
 
       - name: Upload Artifacts on Failure
@@ -64,3 +57,4 @@ jobs:
         with:
           name: error-screenshots
           path: output/screenshots/*.png
+          if-no-files-found: ignore
